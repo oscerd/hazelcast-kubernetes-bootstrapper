@@ -12,6 +12,8 @@
  */
 package com.github.pires.hazelcast;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.GroupConfig;
 import com.hazelcast.config.JoinConfig;
@@ -20,9 +22,8 @@ import com.hazelcast.config.NetworkConfig;
 import com.hazelcast.config.SSLConfig;
 import com.hazelcast.config.TcpIpConfig;
 import com.hazelcast.core.Hazelcast;
-import io.fabric8.kubernetes.api.KubernetesClient;
-import io.fabric8.kubernetes.api.KubernetesFactory;
-import io.fabric8.kubernetes.api.model.Pod;
+import java.io.IOException;
+import java.net.URL;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -32,7 +33,7 @@ import org.springframework.boot.CommandLineRunner;
 import org.springframework.stereotype.Controller;
 
 /**
- * Read from Kubernetes API all labeled Hazelcast pods, get their IP and connect to them.
+ * Read from Kubernetes API all Hazelcast service bound pods, get their IP and connect to them.
  */
 @Controller
 public class HazelcastDiscoveryController implements CommandLineRunner {
@@ -40,8 +41,10 @@ public class HazelcastDiscoveryController implements CommandLineRunner {
   private static final Logger log = LoggerFactory.getLogger(
       HazelcastDiscoveryController.class);
 
-  private static final String HAZELCAST_LABEL_NAME = "name";
-  private static final String HAZELCAST_LABEL_VALUE = "hazelcast";
+  @JsonIgnoreProperties(ignoreUnknown = true)
+  static class Endpoints {
+    public String[] endpoints;
+  }
 
   private static String getEnvOrDefault(String var, String def) {
     final String val = System.getenv(var);
@@ -52,25 +55,42 @@ public class HazelcastDiscoveryController implements CommandLineRunner {
 
   @Override
   public void run(String... args) {
-    final String kubeApiHost = getEnvOrDefault("KUBERNETES_RO_SERVICE_HOST",
+    final String hostName = getEnvOrDefault("KUBERNETES_RO_SERVICE_HOST",
         "localhost");
-    final String kubeApiPort = getEnvOrDefault("KUBERNETES_RO_SERVICE_PORT",
+    final String hostPort = getEnvOrDefault("KUBERNETES_RO_SERVICE_PORT",
         "8080");
-    final String kubeUrl = "http://" + kubeApiHost + ":" + kubeApiPort;
-    log.info("Asking k8s registry at {}..", kubeUrl);
-    final KubernetesClient kube = new KubernetesClient(new KubernetesFactory(
-        kubeUrl));
-    final List<Pod> hazelcastPods = new CopyOnWriteArrayList<>();
-    kube.getPods().getItems().parallelStream().filter(pod
-        -> pod.getLabels().get(HAZELCAST_LABEL_NAME).equals(
-            HAZELCAST_LABEL_VALUE)).forEach(hazelcastPods::add);
-    log.info("Found {} pods running Hazelcast.", hazelcastPods.size());
-    if (!hazelcastPods.isEmpty()) {
-      runHazelcast(hazelcastPods);
+    String serviceName = getEnvOrDefault("HAZELCAST_SERVICE", "cassandra");
+    String path = "/api/v1beta3/endpoints/";
+    final String host = "http://" + hostName + ":" + hostPort;
+    log.info("Asking k8s registry at {}..", host);
+
+    final List<String> hazelcastEndpoints = new CopyOnWriteArrayList<>();
+
+    try {
+      URL url = new URL(host + path + serviceName);
+      ObjectMapper mapper = new ObjectMapper();
+      Endpoints endpoints = mapper.readValue(url, Endpoints.class);
+      if (endpoints != null) {
+        // Here is a problem point, endpoints.endpoints can be null in first node cases.
+        if (endpoints.endpoints != null) {
+          for (String endpoint : endpoints.endpoints) {
+            final String[] parts = endpoint.split(":");
+            hazelcastEndpoints.add(parts[0]);
+          }
+        }
+      }
+    } catch (IOException ex) {
+      log.warn("Request to kubernetes apiserver failed");
+    }
+
+    log.info("Found {} pods running Hazelcast.", hazelcastEndpoints.size());
+
+    if (!hazelcastEndpoints.isEmpty()) {
+      runHazelcast(hazelcastEndpoints);
     }
   }
 
-  private void runHazelcast(final List<Pod> hazelcastPods) {
+  private void runHazelcast(final List<String> nodes) {
     // configure Hazelcast instance
     final Config cfg = new Config();
     cfg.setInstanceName(UUID.randomUUID().toString());
@@ -89,9 +109,7 @@ public class HazelcastDiscoveryController implements CommandLineRunner {
     mcCfg.setEnabled(false);
     // tcp
     final TcpIpConfig tcpCfg = new TcpIpConfig();
-    hazelcastPods.parallelStream().forEach(pod -> {
-      tcpCfg.addMember(pod.getCurrentState().getPodIP());
-    });
+    nodes.parallelStream().forEach(tcpCfg::addMember);
     tcpCfg.setEnabled(true);
     // network join configuration
     final JoinConfig joinCfg = new JoinConfig();
